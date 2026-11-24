@@ -23,6 +23,10 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(test)]
+#[path = "draw_wait_tests.rs"]
+mod wait_tests;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -79,6 +83,14 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend: Option<[f32; 4]>,
+    stencil: u32,
+    // Host RTV/DSV ring slots may have been reused by the next segment.
+    // Save the views themselves so resuming can allocate fresh handles.
+    target_views: Vec<(ID3D12Resource, Option<D3D12_RENDER_TARGET_VIEW_DESC>)>,
+    depth_view: Option<(ID3D12Resource, Option<D3D12_DEPTH_STENCIL_VIEW_DESC>)>,
 }
 
 impl Drop for State {
@@ -167,6 +179,64 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// A memory wait starts a new host list while preserving title state.
+    pub(crate) fn resume(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        viewports(list, &self.viewports);
+        scissors(list, &self.scissors);
+        if let Some(blend) = self.blend.as_ref() {
+            blend_factor(list, Some(blend));
+        }
+        stencil_ref(list, self.stencil);
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let rtvs: Vec<_> = self
+            .target_views
+            .iter()
+            .map(|(texture, desc)| host.rtv(texture, desc.as_ref()))
+            .collect();
+        let dsv = self
+            .depth_view
+            .as_ref()
+            .map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
+        // SAFETY: an open list, with fresh views of the saved resources.
+        unsafe {
+            list.list.OMSetRenderTargets(
+                rtvs.len() as u32,
+                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                false,
+                dsv.as_ref().map(std::ptr::from_ref),
+            );
+        }
+    }
+
+    pub(crate) fn set_viewports(&mut self, list: &HostList, values: &[D3D12_VIEWPORT]) {
+        self.viewports = values.to_vec();
+        viewports(list, values);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, values: &[RECT]) {
+        self.scissors = values.to_vec();
+        scissors(list, values);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, value: Option<&[f32; 4]>) {
+        self.blend = value.copied();
+        blend_factor(list, value);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, value: u32) {
+        self.stencil = value;
+        stencil_ref(list, value);
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -266,6 +336,7 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.target_views.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -281,15 +352,21 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            let desc = record.desc();
+            rtvs.push(host.rtv(texture, desc.as_ref()));
+            self.target_views.push((texture.clone(), desc));
         }
         self.depth = 0;
+        self.depth_view = None;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            let desc = record.depth_desc();
+            let view = host.dsv(texture, desc.as_ref());
+            self.depth_view = Some((texture.clone(), desc));
+            Some(view)
         });
         // SAFETY: an open list; the views were just made.
         unsafe {

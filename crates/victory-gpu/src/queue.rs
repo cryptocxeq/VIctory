@@ -131,24 +131,66 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // Held until they run: the title may reset its lists before.
         let host_lists: Vec<_> = lists
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .flat_map(|&l| crate::list::submission(l))
             .collect();
-        queue(this).timeline.submit(Op::Run(Box::new(move || {
-            if let Some(host) = crate::host::host() {
-                let runs: Vec<_> = host_lists.iter().map(|l| &**l).collect();
-                host.execute(&runs);
-                for list in host_lists {
-                    if let Ok(orphan) = std::sync::Arc::try_unwrap(list) {
-                        host.recycle_list(orphan);
-                    }
-                }
+        let submitted = std::sync::Arc::new(Submitted(host_lists));
+        let mut ops = Vec::new();
+        let mut first = 0;
+        for (i, (_, wait)) in submitted.0.iter().enumerate() {
+            if let Some(wait) = wait {
+                ops.push(submitted.run(first, i + 1));
+                ops.push(Op::MemoryWait(*wait));
+                first = i + 1;
             }
-        })));
+        }
+        if first < submitted.0.len() {
+            ops.push(submitted.run(first, submitted.0.len()));
+        }
+        queue(this).timeline.submit_many(ops);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
+    }
+}
+
+/// Every part of a split submission keeps every segment alive. In
+/// particular, a suffix may read upload memory allocated before its wait.
+#[cfg(windows)]
+struct Submitted(
+    Vec<(
+        std::sync::Arc<crate::host::HostList>,
+        Option<crate::memory_wait::Wait>,
+    )>,
+);
+
+#[cfg(windows)]
+impl Submitted {
+    fn run(self: &std::sync::Arc<Self>, first: usize, end: usize) -> Op {
+        let submitted = self.clone();
+        Op::Run(Box::new(move || {
+            if let Some(host) = crate::host::host() {
+                let runs: Vec<_> = submitted.0[first..end]
+                    .iter()
+                    .map(|(list, _)| &**list)
+                    .collect();
+                host.execute(&runs);
+            }
+        }))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Submitted {
+    fn drop(&mut self) {
+        if let Some(host) = crate::host::host() {
+            for (list, _) in self.0.drain(..) {
+                if let Ok(orphan) = std::sync::Arc::try_unwrap(list) {
+                    host.recycle_list(orphan);
+                }
+            }
+        }
     }
 }
 

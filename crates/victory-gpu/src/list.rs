@@ -118,6 +118,15 @@ struct List {
     /// Shared with submissions still to run (queues held back by a wait).
     #[cfg(windows)]
     host: std::sync::Mutex<Option<std::sync::Arc<crate::host::HostList>>>,
+    /// Closed segments and the waits immediately after them. The current
+    /// host list holds the commands after the last wait.
+    #[cfg(windows)]
+    segments: std::sync::Mutex<
+        Vec<(
+            std::sync::Arc<crate::host::HostList>,
+            crate::memory_wait::Wait,
+        )>,
+    >,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -165,6 +174,29 @@ pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostLi
     // SAFETY: the title passes one of our lists.
     let host = unsafe { &(*this.cast::<List>()).host };
     host.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+#[cfg(windows)]
+pub(crate) fn submission(
+    this: This,
+) -> Vec<(
+    std::sync::Arc<crate::host::HostList>,
+    Option<crate::memory_wait::Wait>,
+)> {
+    let Some(current) = host_list(this) else {
+        return Vec::new();
+    };
+    // SAFETY: the title passes a closed list for submission.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut segments: Vec<_> = list
+        .segments
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(list, wait)| (list.clone(), Some(*wait)))
+        .collect();
+    segments.push((current, None));
+    segments
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -249,6 +281,8 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         })),
         #[cfg(windows)]
         state: Default::default(),
+        #[cfg(windows)]
+        segments: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
@@ -325,6 +359,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         }
         state.reset(pipeline);
     });
+    #[cfg(windows)]
+    list.segments
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     #[cfg(not(windows))]
     let _ = (this, pipeline);
     S_OK
@@ -967,7 +1006,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -989,25 +1028,21 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(&list, items(viewports, count));
-        }
+        with_state(this, |list, s| {
+            s.set_viewports(list, items(viewports, count))
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(&list, items(rects, count));
-        }
+        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
+        with_state(this, |list, s| {
             // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(&list, unsafe { factor.as_ref() });
-        }
+            s.set_blend_factor(list, unsafe { factor.as_ref() })
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(&list, reference);
-        }
+        with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
@@ -1278,10 +1313,50 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
+/// The 32-bit memory wait has a separate ABI (including a mask) and is
+/// still unimplemented. Do not route it through the 64-bit method.
 extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+
+/// Wait64BitValueX(address, D3D12_COMPARISON_FUNC, reference, flags).
+/// The trailing flags are not a mask: all 64 bits participate in the test.
+extern "system" fn wait64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        if !(1..=8).contains(&comparison) {
+            crate::host::fail(format_args!("invalid memory-wait comparison {comparison}"));
+        }
+        // Acquire the replacement before changing the recording, so an
+        // allocation failure cannot leave it partially split.
+        let next = host.acquire_list().unwrap_or_else(|e| {
+            crate::host::fail(format_args!("could not split a list at a memory wait: {e}"))
+        });
+        // SAFETY: called on one of our lists; recording is externally serialized.
+        let list = unsafe { &*this.cast::<List>() };
+        let mut current = list.host.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(previous) = current.take() else {
+            return;
+        };
+        previous.close();
+        list.segments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((
+                previous,
+                crate::memory_wait::Wait {
+                    address,
+                    comparison,
+                    reference,
+                },
+            ));
+        list.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resume(&next);
+        *current = Some(std::sync::Arc::new(next));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, comparison, reference);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1385,7 +1460,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (72, wait64 as *const ()),                    // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1453,6 +1528,10 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(test, windows))]
+#[path = "list_wait_tests.rs"]
+mod wait_tests;
 
 #[cfg(test)]
 mod tests {

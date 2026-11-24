@@ -21,6 +21,8 @@ use crate::fence::Held;
 pub(crate) enum Op {
     /// Hold back what follows until the fence reaches the value.
     Wait(Held, u64),
+    #[cfg(windows)]
+    MemoryWait(crate::memory_wait::Wait),
     /// Command lists to run, a fence to signal.
     Run(Box<dyn FnOnce() + Send>),
 }
@@ -53,9 +55,17 @@ impl Timeline {
     /// Work another thread is running for the queue is waited for, as a
     /// submission's own work is.
     pub(crate) fn submit(self: &Arc<Self>, op: Op) {
+        self.submit_many([op]);
+    }
+
+    /// Enqueue a whole submission before running any part of it, so other
+    /// callers cannot interleave work between its command-list segments.
+    pub(crate) fn submit_many(self: &Arc<Self>, ops: impl IntoIterator<Item = Op>) {
         let mut s = self.lock();
-        s.ops.push_back(op);
-        s.pushed += 1;
+        for op in ops {
+            s.ops.push_back(op);
+            s.pushed += 1;
+        }
         let ticket = s.pushed;
         while s.busy && s.done < ticket {
             s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
@@ -65,11 +75,13 @@ impl Timeline {
         }
         // Still held back unless the value was reached by a path that does
         // not wake us (a CPU write to the fence's memory).
-        if s.held
-            && let Some(Op::Wait(fence, value)) = s.ops.front()
-            && !fence.reached(*value)
-        {
-            return;
+        if s.held {
+            match s.ops.front() {
+                Some(Op::Wait(fence, value)) if !fence.reached(*value) => return,
+                #[cfg(windows)]
+                Some(Op::MemoryWait(wait)) if !wait.reached() => return,
+                _ => {}
+            }
         }
         self.run(s);
     }
@@ -87,6 +99,14 @@ impl Timeline {
         s.held = false;
         while let Some(op) = s.ops.pop_front() {
             match op {
+                #[cfg(windows)]
+                Op::MemoryWait(wait) => {
+                    if !wait.wait_on_gpu(self) {
+                        s.ops.push_front(Op::MemoryWait(wait));
+                        s.held = true;
+                        break;
+                    }
+                }
                 Op::Wait(fence, value) => {
                     // Checked and registered under the fence's lock, so a
                     // signal after this check wakes us.
