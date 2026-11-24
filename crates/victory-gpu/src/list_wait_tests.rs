@@ -147,6 +147,9 @@ fn finish(fence: &Owned) {
 
 #[test]
 fn memory_wait_orders_two_queues() {
+    if crate::host::host().is_none() {
+        return;
+    }
     for newer in [false, true] {
         for consumer_first in [false, true] {
             for (comparison, counter_value, reference, flags) in
@@ -183,6 +186,9 @@ fn memory_wait_orders_two_queues() {
 
 #[test]
 fn memory_wait_preserves_work_before_and_between_waits() {
+    if crate::host::host().is_none() {
+        return;
+    }
     for newer in [false, true] {
         let (a, b, c, result) = (
             AtomicU64::new(0),
@@ -220,6 +226,9 @@ fn memory_wait_preserves_work_before_and_between_waits() {
 
 #[test]
 fn memory_wait_observes_cpu_writes_and_keeps_pending_recordings() {
+    if crate::host::host().is_none() {
+        return;
+    }
     for drop_list in [false, true] {
         let (ready, result) = (AtomicU64::new(0), AtomicU64::new(0));
         let recording = Recording::new(true);
@@ -264,6 +273,9 @@ fn memory_wait_observes_cpu_writes_and_keeps_pending_recordings() {
 
 #[test]
 fn memory_wait_compares_the_high_dword() {
+    if crate::host::host().is_none() {
+        return;
+    }
     let (ready, result) = (AtomicU64::new(2), AtomicU64::new(0));
     let consumer = Recording::new(true);
     let done = done_fence();
@@ -283,6 +295,9 @@ fn memory_wait_compares_the_high_dword() {
 
 #[test]
 fn memory_wait_keeps_later_lists_and_submissions_behind_it() {
+    if crate::host::host().is_none() {
+        return;
+    }
     let (ready, result) = (AtomicU64::new(0), AtomicU64::new(0));
     let first = Recording::new(true);
     let second = Recording::new(true);
